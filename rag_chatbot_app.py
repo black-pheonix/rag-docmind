@@ -52,16 +52,23 @@ html, body, [class*="css"] {
 }
 
 /* ── Hide Streamlit chrome ── */
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+/* Remove sidebar collapse/expand button — target all buttons that are
+   direct children of the sidebar's root divs (the toggle is the only one there) */
+section[data-testid="stSidebar"] > div > button,
+section[data-testid="stSidebar"] > div > div > button { display: none !important; }
 .block-container { padding: 2rem 2rem 4rem !important; max-width: 1400px; }
 
 /* ── Sidebar ── */
 [data-testid="stSidebar"] {
     background: var(--surface) !important;
     border-right: 1px solid var(--border) !important;
+    min-width: 320px  !important max-width: 320px !important;
 }
 [data-testid="stSidebar"] > div:first-child { padding-top: 1.5rem; }
-
+[data-testid="collapsedControl"] {
+    display: none !important;
+}
 /* ── Logo / Title Block ── */
 .logo-block {
     font-family: var(--mono);
