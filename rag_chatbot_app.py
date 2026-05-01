@@ -276,7 +276,10 @@ def load_classifier():
 def load_generator():
     from transformers import pipeline
     return pipeline("text2text-generation", model="google/flan-t5-base")
-
+@st.cache_resource(show_spinner=False)
+def load_reranker():
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # ─── Core Pipeline Functions ──────────────────────────────────────────────────
 def process_pdf(uploaded_file) -> list:
@@ -347,8 +350,20 @@ def build_vectorstore(chunks: list):
 def answer_query(vectorstore, query: str, k: int = 3) -> tuple[str, list]:
     """Retrieve relevant chunks and generate a grounded answer."""
     generator = load_generator()
-    results = vectorstore.similarity_search(query, k=k)
-    context = "\n\n".join([doc.page_content for doc in results])
+    
+    reranker = load_reranker()
+    initial_results = vectorstore.similarity_search(query, k=6)
+
+    pairs = [(query, doc.page_content) for doc in initial_results]
+    scores = reranker.predict(pairs)
+
+    scored_docs = list(zip(initial_results, scores))
+    scored_docs.sort(key=lambda x: x[1], reverse=True)
+    top_docs = [doc for doc, _ in scored_docs[:k]]
+
+
+    # results = vectorstore.similarity_search(query, k=k)
+    context = "\n\n".join([doc.page_content for doc in top_docs])
 
     prompt = f"""Answer the question using ONLY the context below.
 If the answer is a specific value, return only the value.
@@ -365,7 +380,7 @@ Answer:"""
 
     response = generator(prompt, max_length=150, min_length=5)
     answer_text = response[0]["generated_text"].strip()
-    return answer_text, results
+    return answer_text, top_docs
 
 # ─── Session State Defaults ───────────────────────────────────────────────────
 defaults = {
@@ -447,6 +462,7 @@ with st.sidebar:
         ("Classifier", "bart-large-mnli"),
         ("Generator", "flan-t5-base"),
         ("Vector DB", "FAISS (in-memory)"),
+        ("CrossEncoder", "ms-marco-MiniLM-L-6-v2"),
     ]:
         st.markdown(
             f"<div style='display:flex;justify-content:space-between;margin:4px 0;"
