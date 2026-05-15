@@ -1,19 +1,10 @@
-"""
-RAG Chatbot — PDF-Grounded Question Answering
-A production-ready Streamlit application powered by LangChain, FAISS, and HuggingFace models.
-
-Features:
-  • PDF ingestion & recursive text chunking
-  • Zero-shot technical document validation (facebook/bart-large-mnli)
-  • Semantic vector search via FAISS + all-MiniLM-L6-v2 embeddings
-  • Answer generation with google/flan-t5-base
-  • Persistent chat history with source citations
-"""
 
 import streamlit as st
 import time
+import re
 import textwrap
 from pathlib import Path
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ─── Page Config (must be first Streamlit call) ───────────────────────────────
 st.set_page_config(
@@ -257,6 +248,36 @@ hr { border-color: var(--border) !important; margin: 1rem 0 !important; }
     font-size: 0.78rem; color: var(--text-dim);
     transition: all 0.15s;
 }
+
+/* ── Query clarification card ── */
+.clarify-card {
+    padding: 1rem 1.25rem;
+    border: 1px solid rgba(245,166,35,0.45);
+    border-radius: 10px;
+    background: rgba(245,166,35,0.05);
+    margin-bottom: 1.1rem;
+    animation: fadeUp 0.3s ease;
+}
+.clarify-tag {
+    font-family: var(--mono); font-size: 0.65rem; font-weight: 700;
+    color: var(--amber); text-transform: uppercase; letter-spacing: 0.1em;
+    margin-bottom: 0.55rem;
+}
+.clarify-body {
+    font-size: 0.88rem; color: var(--text-dim); line-height: 1.65;
+    margin-bottom: 0.6rem;
+}
+.clarify-orig {
+    display: inline-block;
+    font-family: var(--mono); font-size: 0.78rem;
+    color: var(--muted); text-decoration: line-through;
+    background: rgba(255,255,255,0.04); padding: 3px 8px;
+    border-radius: 4px; margin-top: 2px;
+}
+.clarify-hint {
+    font-size: 0.78rem; color: var(--muted); margin-top: 0.45rem;
+    font-style: italic;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -275,7 +296,8 @@ def load_classifier():
 @st.cache_resource(show_spinner=False)
 def load_generator():
     from transformers import pipeline
-    return pipeline("text2text-generation", model="google/flan-t5-base")
+    # return pipeline("text2text-generation", model="google/flan-t5-base")
+    return pipeline("text2text-generation", model="google/flan-t5-large")
 @st.cache_resource(show_spinner=False)
 def load_reranker():
     from sentence_transformers import CrossEncoder
@@ -346,6 +368,121 @@ def build_vectorstore(chunks: list):
     embeddings = load_embedding_model()
     return FAISS.from_documents(chunks, embeddings)
 
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+def rewrite_query(query):
+    # 1. Generate the rewrite query
+    generator = load_generator()
+
+    prompt = f"""
+    Rewrite the user query into a clear, specific, and retrieval-friendly query.
+Rules:
+- Preserve the original intent.
+- Do not introduce new assumptions or unrelated details.
+- Add missing context only if it is strongly implied.
+- Keep it concise and to the point.
+- Prefer technical phrasing when appropriate.
+- If the query is already clear and specific, return it unchanged.
+
+user query: 
+{query}
+rewritten query:"""
+
+    response = generator(prompt, max_new_tokens = 30)
+    rewritten_query = response[0]["generated_text"].strip()
+    # 2. Compute the cosine similarity between the original query and the rewrite query
+
+    if "Rewritten Query:" in rewritten_query:
+        rewritten_query = rewritten_query.split("Rewritten Query:")[-1].strip()
+    
+    embeddings = load_embedding_model()
+    original_emb = embeddings.embed_query(query)
+    new_emb = embeddings.embed_query(rewritten_query)
+
+    similarity = cosine_similarity([original_emb], [new_emb])[0][0]
+    # 3. Extract meaningful tokens and keywords from the original and rewrite query and find the meaningful token gain.
+    orig = query.lower()
+    rewrite = rewritten_query.lower()
+
+    orig = re.sub(r'[^a-zA-Z0-9\s]','', orig)
+    rewrite = re.sub(r'[^a-zA-Z0-9\s]','', rewrite)
+
+    orig_tokens = orig.split()
+    rewrite_tokens = rewrite.split()
+
+    original_meaningful = set([t for t in orig_tokens if t not in ENGLISH_STOP_WORDS])
+    rewrite_meaningful = set([t for t in rewrite_tokens if t not in ENGLISH_STOP_WORDS])
+
+    token_gain = len(rewrite_meaningful - original_meaningful)
+    # 4. If cosine similarity is above a certain threshold and token gain is also greater than a certain threshold and rewrite query != original query,
+    # then return the rewrite query, else return the original query.
+
+    if similarity < 0.8:
+        use_rewrite = False
+    elif query.strip().lower() == rewritten_query.strip().lower():
+        use_rewrite = False
+    elif token_gain > 0:
+        use_rewrite = True
+    else:
+        use_rewrite = False
+    
+    if use_rewrite == True:
+        final_query = rewritten_query
+    else:
+        final_query = query
+    rewritten_dict = {
+        "rewritten_query": rewritten_query,
+        "original_query": query,
+        "final_query": final_query,
+        "accepted": use_rewrite,
+        "similarity": similarity,
+        "token_gain": token_gain,
+    }
+    print(rewritten_dict)
+    return rewritten_dict
+    # 5. Return format: a dict: {"rewrite_query": str, "original_query": str, "final_query": str, "accepted": True/False, "Similarity": float, "Token_Gain": int}
+
+
+def classify_query_clarity(query: str) -> tuple[bool, float]:
+    """
+    Detect whether a query is too vague or ambiguous to retrieve useful results.
+
+    Strategy — no new model added:
+      1. Cheap heuristic: strip stop-words; if ≤1 meaningful token remains,
+         it's almost certainly vague (e.g. "it", "explain", "tell me").
+      2. Zero-shot classification via the *already-loaded* bart-large-mnli
+         classifier, using two opposing candidate labels.  The model's own
+         NLI head naturally handles ambiguity, incomplete questions, and
+         context-free pronouns without any fine-tuning.
+
+    Returns:
+        (is_ambiguous: bool, confidence: float)
+    """
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+    # ── Heuristic pre-check ──────────────────────────────────────────────────
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', query.lower())
+    meaningful_tokens = [t for t in cleaned.split() if t not in ENGLISH_STOP_WORDS]
+
+    if len(meaningful_tokens) == 0:
+        return True, 0.99
+    if len(meaningful_tokens) == 1:
+        # Single meaningful word with no context is always vague.
+        return True, 0.95
+
+    # ── Zero-shot classification (reuses bart-large-mnli) ────────────────────
+    classifier = load_classifier()
+    candidate_labels = [
+        "clear and specific question",
+        "vague or ambiguous question",
+    ]
+    # Truncate to 256 chars — query classification needs very little context.
+    result = classifier(query[:256], candidate_labels=candidate_labels)
+    top_label = result["labels"][0]
+    top_score = result["scores"][0]
+
+    is_ambiguous = (top_label == "vague or ambiguous question")
+    return is_ambiguous, top_score
+
 
 def answer_query(vectorstore, query: str, k: int = 3) -> tuple[str, list]:
     """Retrieve relevant chunks and generate a grounded answer."""
@@ -396,6 +533,12 @@ defaults = {
     "chunk_overlap": 100,
     "top_k": 3,
     "show_sources": True,
+    # ── Query clarification ──────────────────────────────────────────────────
+    # When a vague query is detected the pipeline halts here.  The original
+    # query is stored in `ambiguous_query` but is NEVER appended to `messages`,
+    # so it is completely absent from the chat history and vector pipeline.
+    "pending_clarification": False,
+    "ambiguous_query": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -460,7 +603,10 @@ with st.sidebar:
     for label, model in [
         ("Embeddings", "MiniLM-L6-v2"),
         ("Classifier", "bart-large-mnli"),
-        ("Generator", "flan-t5-base"),
+        ("· doc validation", "zero-shot"),
+        ("· query clarity", "zero-shot"),
+        # ("Generator", "flan-t5-base"),
+        ("Generator", "flan-t5-large"),
         ("Vector DB", "FAISS (in-memory)"),
         ("CrossEncoder", "ms-marco-MiniLM-L-6-v2"),
     ]:
@@ -648,6 +794,31 @@ with col_chat:
 
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
+        # ── Clarification banner ─────────────────────────────────────────────
+        # Shown when the last submitted query was flagged as vague/ambiguous.
+        # The original query is displayed with a strike-through to make clear
+        # it was discarded and will NOT appear in the conversation history.
+        if st.session_state.pending_clarification:
+            orig = st.session_state.ambiguous_query
+            st.markdown(
+                f"""
+                <div class='clarify-card'>
+                    <div class='clarify-tag'>⚠ Query Needs Clarification</div>
+                    <div class='clarify-body'>
+                        Your query was too vague or ambiguous to retrieve useful results.
+                        It has been <strong>removed</strong> from the pipeline and will not
+                        appear in your chat history.
+                    </div>
+                    <div class='clarify-orig'>✗ &nbsp;{orig}</div>
+                    <div class='clarify-hint'>
+                        Please rephrase with more specific details — e.g. include
+                        technical terms, component names, or a concrete question.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         # Key counter — incrementing it forces Streamlit to treat the
         # text_input as a brand-new widget, which clears the value.
         if "input_key" not in st.session_state:
@@ -659,15 +830,21 @@ with col_chat:
         # Input row
         input_col, btn_col = st.columns([5, 1])
         with input_col:
+            _placeholder = (
+                "Clarify your query with more specific details…"
+                if st.session_state.pending_clarification
+                else "Ask a question about your document…"
+            )
             query = st.text_input(
                 label="query",
-                placeholder="Ask a question about your document…",
+                placeholder=_placeholder,
                 label_visibility="collapsed",
                 key=f"query_input_{st.session_state.input_key}",
                 value=pending,
             )
         with btn_col:
-            send = st.button("Send ➤", use_container_width=True)
+            _btn_label = "Clarify ➤" if st.session_state.pending_clarification else "Send ➤"
+            send = st.button(_btn_label, use_container_width=True)
 
         # ── CRITICAL FIX ──────────────────────────────────────────────────────
         # Only fire when the user explicitly pressed Send OR a suggestion chip
@@ -680,13 +857,37 @@ with col_chat:
         if should_submit:
             user_query = (pending or query).strip()
 
-            # Add user message
+            # ── Branch A: user is responding to a clarification request ─────
+            # The previous vague query was already discarded (never added to
+            # messages).  Accept whatever the user typed now as the real query
+            # and fall straight through to the normal retrieval pipeline.
+            if st.session_state.pending_clarification:
+                st.session_state.pending_clarification = False
+                st.session_state.ambiguous_query = ""
+                # fall through ↓
+
+            # ── Branch B: fresh query — check clarity first ──────────────────
+            else:
+                with st.spinner("Checking query clarity…"):
+                    is_ambiguous, clarity_conf = classify_query_clarity(user_query)
+
+                if is_ambiguous and clarity_conf > 0.65:
+                    # Gate the pipeline: store the vague text but do NOT add it
+                    # to messages or pass it to the vectorstore / generator.
+                    st.session_state.pending_clarification = True
+                    st.session_state.ambiguous_query = user_query
+                    st.session_state.input_key += 1   # clears the input box
+                    st.rerun()
+
+            # ── Normal pipeline (reached only for clear / clarified queries) ─
             st.session_state.messages.append({"role": "user", "content": user_query})
+            rewrite_dict = rewrite_query(user_query)
+            search_query = rewrite_dict["final_query"]
 
             with st.spinner("Retrieving and generating…"):
                 answer, source_docs = answer_query(
                     st.session_state.vectorstore,
-                    user_query,
+                    search_query,
                     k=st.session_state.top_k,
                 )
 
@@ -754,6 +955,7 @@ with col_info:
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
+    
     # About
     st.markdown("""
     <div style='font-size:0.72rem;color:#4a5070;line-height:1.7'>
